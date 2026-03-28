@@ -1,77 +1,51 @@
-# ADR-001: Evaluation Design for Foundation Model vs. Classical ML Benchmark
+# Architecture Decision Records
 
-**Status:** Accepted  
-**Date:** 2026-03
+## ADR-001: Evaluation Design
 
----
+**Status:** Accepted | **Date:** 2026-03
 
-## Context
+Chronos produces probabilistic forecasts (quantiles), LightGBM produces point forecasts. For a fair comparison, Chronos quantiles are converted to point forecasts via the **median** (0.5 quantile) — robust to extreme tails and standard in Chronos literature.
 
-Two models are being benchmarked on the same test set:
-
-- LightGBM: produces point forecasts directly.
-- Amazon Chronos: produces probabilistic forecasts (a distribution over quantiles),
-  not point forecasts.
-
-For a fair comparison on standard regression metrics (RMSE, MAE, MAPE, RMSLE),
-both models must produce a single predicted value per (date, store_nbr, family).
-
-A second question: which metric is primary for the benchmark? The Kaggle
-Store Sales competition uses RMSLE, not RMSE. Sales data is strongly right-skewed,
-which makes log-scale metrics more meaningful.
+Primary metric is **RMSLE**, consistent with the Kaggle competition and the right-skewed sales distribution. Secondary metrics: RMSE, MAE, Asymmetric Loss (understock weight 10x, reflecting stockout > overstock cost in retail). Both models receive identical external features, making information access equal.
 
 ---
 
-## Decisions
+## ADR-002: Dataset Subset Selection
 
-### 1. Chronos point forecast conversion: Median
+**Status:** Accepted | **Date:** 2026-03
 
-Chronos quantile forecasts are converted to point forecasts using the **median**
-(0.5 quantile), not the mean.
+**Families:** 19 of 33 families included (zero-rate < 30%). EDA showed a natural break at ~35% — families above this threshold are sparse/niche categories where neither model produces meaningful forecasts.
 
-```python
-# forecast shape: (num_series, num_samples, prediction_length)
-point_forecast = torch.quantile(forecast, 0.5, dim=1)
-```
+**Stores:** Top 14 stores by volume (~50% of total sales). Family-mix variance across stores is low (max std 0.055), making the top stores representative of the full population.
 
-Alternatives considered:
+**Oil price excluded:** Raw correlation of -0.528 with sales is a time-trend confounding effect, confirmed by year-stratified analysis. Including it would introduce time-trend leakage.
 
-| Option | Pros | Cons |
+---
+
+## ADR-003: Direct vs. Recursive Forecasting
+
+**Status:** Accepted | **Date:** 2026-03
+
+Both approaches were trained and evaluated empirically on the same 15-day validation set.
+
+| Metric | Direct | Recursive (real inference) |
 |---|---|---|
-| Median (chosen) | Robust to extreme quantiles. Standard in Chronos literature. | None for this use case. |
-| Mean of samples | Matches expected value interpretation. | Biased upward by extreme quantile tails. |
-| Mode (highest density) | Most likely single outcome. | Complex to compute from samples, rarely used. |
+| RMSLE | **0.2588** | 0.2594 |
+| RMSE | **288.77** | 290.59 |
+| MAE | **124.67** | 126.55 |
 
-### 2. Primary metric: RMSLE
-
-RMSLE is the primary metric for leaderboard comparison and model selection.
-RMSE, MAE, and MAPE are reported as secondary metrics for completeness.
-
-Rationale: The Kaggle competition uses RMSLE. Sales data is right-skewed.
-RMSLE penalises under-forecasting more than over-forecasting, which matches
-the business cost structure of retail demand planning (stockouts are more
-expensive than overstock).
-
-RMSLE formula: `sqrt(mean((log1p(y_pred) - log1p(y_true))^2))`
-
-Note: `log1p` handles zero-sales days (common in this dataset) without
-producing -inf.
-
-### 3. Leaderboard anchoring
-
-LightGBM results will be compared against the public Kaggle leaderboard
-(https://www.kaggle.com/competitions/store-sales-time-series-forecasting/leaderboard)
-to provide an external reference point for model quality. This is not the
-primary goal of the benchmark, but it provides a defensible anchor for
-interview discussions ("Top X% without ensembling").
+Direct wins on all fair metrics. Recursive shows measurable error accumulation (+0.0006 RMSLE) over 15 steps despite the short horizon. Direct proceeds to the Chronos benchmark.
 
 ---
 
-## Consequences
+## ADR-004: Chronos-2 as Foundation Model
 
-- LightGBM objective should be `tweedie` or `huber` (appropriate for skewed
-  sales data), not the default `mse`. Final choice to be validated in EDA
-  based on the sales distribution.
-- Both models are evaluated on the same held-out test set with identical code.
-- Chronos predictions are computed on Kaggle GPU, exported in the exchange
-  schema, and evaluated locally. See `notebooks/kaggle_setup.txt` for schema.
+**Status:** Accepted | **Date:** 2026-03
+
+Chronos-1 (original plan) is univariate-only and cannot incorporate external covariates. EDA showed `onpromotion` alone drives 24-208% sales lift — making Chronos-1 structurally disadvantaged in any fair benchmark.
+
+Chronos-2 (released October 2025, 120M parameters) supports past and future covariates natively within a single zero-shot architecture. This enables a genuinely fair comparison: both models receive identical external features.
+
+**Result:** Chronos-2 with covariates achieves RMSLE 0.2581 vs. LightGBM 0.2588 — nearly identical on log-scale accuracy. LightGBM retains a clear advantage on RMSE (288 vs. 465), MAE (125 vs. 163), Asymmetric Loss (500 vs. 550), inference speed (~1s CPU vs. 14.8s GPU), and model size (11.2 MB vs. 478 MB).
+
+The benchmark conclusion: given equal information access, Foundation Models match classical ML on relative accuracy (RMSLE) but lose on absolute error metrics and operational cost.
